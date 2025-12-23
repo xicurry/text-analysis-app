@@ -1,11 +1,10 @@
 """
 URL文本词频分析可视化系统
 功能：
-1. 抓取指定URL的文章文本内容
+1. 抓取指定URL的**整个网页**文本内容（支持多URL批量爬取）
 2. 中文分词与词频统计（过滤停用词、低频词）
 3. 基于Pyecharts的多图表可视化（9种图表）
 4. Streamlit交互式界面（侧边栏图表筛选、低频词过滤）
-
 """
 
 import streamlit as st
@@ -14,7 +13,10 @@ from bs4 import BeautifulSoup
 import jieba
 import re
 from collections import Counter
-import numpy as np
+# 引入自定义模块
+import crawler
+import text_proc
+
 # Pyecharts相关
 from pyecharts import options as opts
 from pyecharts.charts import WordCloud, Bar, Line, Pie, Radar, Scatter, HeatMap, TreeMap, Polar
@@ -39,80 +41,52 @@ STOP_WORDS = set([
     "此", "该", "其", "或", "即", "因", "由", "及", "并", "个", "位", "件", "条", "本", "项"
 ])
 
-# 无效字符过滤正则
-INVALID_CHAR_REG = re.compile(r"[^\u4e00-\u9fa5a-zA-Z0-9]")
-
 # ---------------------- 核心函数 ----------------------
-def fetch_url_content(url: str) -> str:
+def fetch_url_all_text(url: str) -> str:
     """
-    抓取URL页面的文本内容（适配常见新闻网站结构）
-    :param url: 文章URL
-    :return: 抓取的文本内容（标题+正文）
+    抓取**整个网页**的所有文本内容（替代原文章详情页抓取逻辑）
+    :param url: 目标网页URL
+    :return: 网页所有可见文本内容
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
-    }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()  # 抛出HTTP错误
-        response.encoding = response.apparent_encoding  # 自动识别编码
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        # 抓取标题
-        title = soup.find("h1") or soup.find("title")
-        title_text = title.get_text(strip=True) if title else ""
-        
-        # 抓取正文（匹配常见的正文容器类名）
-        content_tags = soup.find_all(
-            ["div", "p"], 
-            attrs={"class": re.compile(r"content|article|main|text|body|content-box", re.I)}
-        )
-        content_text = ""
-        for tag in content_tags:
-            # 过滤script/style标签
-            for script in tag(["script", "style"]):
-                script.extract()
-            content_text += tag.get_text(strip=True) + " "
-        
-        # 合并标题+正文
-        full_text = title_text + " " + content_text
-        if not full_text.strip():
-            st.warning("未抓取到有效文本内容，请检查URL是否为文章详情页")
+        # 调用crawler.py的函数获取网页文本（统一爬取逻辑）
+        html_content = crawler.get_web_page(url)
+        if not html_content:
+            st.error(f"无法获取{url}的网页内容")
+            return ""
+        # 调用crawler.py的解析函数提取完整文本
+        full_text = crawler.parse_page(html_content)
+        if not full_text:
+            st.warning(f"未从{url}中提取到有效文本")
+            return ""
         return full_text
-    except requests.exceptions.RequestException as e:
-        st.error(f"URL抓取失败：{str(e)}")
+    except Exception as e:
+        st.error(f"抓取{url}失败：{str(e)}")
         return ""
 
-def segment_text(text: str) -> list:
+def process_text_for_freq(text: str, min_freq: int) -> tuple:
     """
-    文本分词：过滤无效字符、停用词，返回有效词列表
+    文本处理与词频统计（整合text_proc.py的逻辑）
     :param text: 原始文本
-    :return: 有效词列表
+    :param min_freq: 最小词频阈值
+    :return: (top20_words, word_freq)
     """
-    # 过滤无效字符
-    clean_text = INVALID_CHAR_REG.sub(" ", text)
-    # jieba分词
+    # 调用text_proc.py的清洗函数
+    text_without_html = text_proc.remove_html_tags(text)
+    clean_text = text_proc.remove_punctuation(text_without_html)
+    # 分词（加入停用词过滤）
     words = jieba.lcut(clean_text)
-    # 过滤停用词、单字、空白词
     valid_words = [
         word for word in words
         if len(word) > 1 
         and word not in STOP_WORDS 
-        and not word.isspace()
+        and not word.isdigit()
     ]
-    return valid_words
-
-def get_word_freq(words: list, min_freq: int) -> Counter:
-    """
-    统计词频，过滤低频词
-    :param words: 有效词列表
-    :param min_freq: 最小词频阈值
-    :return: 过滤后的词频统计结果
-    """
-    word_counter = Counter(words)
-    # 过滤低于最小词频的词
+    # 统计词频
+    word_counter = Counter(valid_words)
     filtered_counter = Counter({k: v for k, v in word_counter.items() if v >= min_freq})
-    return filtered_counter
+    top20_words = filtered_counter.most_common(20)
+    return top20_words, filtered_counter
 
 # ---------------------- 侧边栏：图表筛选 ----------------------
 st.sidebar.title("📊 可视化图表筛选")
@@ -127,48 +101,56 @@ chart_type = st.sidebar.selectbox(
 
 # ---------------------- 主页面：输入与分析 ----------------------
 st.title("🔍 URL文本词频分析可视化系统")
-st.markdown("### 请输入文章URL，一键分析文本词频并可视化")
+st.markdown("### 请输入网页URL，一键分析**整站文本**词频并可视化")
 
-# 1. URL输入框
-url = st.text_input(
-    "文章URL", 
-    value="", 
-    placeholder="例如：https://www.example.com/news/123.html"
-)
+# 1. 多URL输入支持（适配整站多页面爬取）
+url_count = st.number_input("要分析的URL数量", min_value=1, max_value=5, value=1, step=1)
+urls = []
+for i in range(url_count):
+    url = st.text_input(
+        f"网页URL {i+1}", 
+        value="", 
+        placeholder="例如：https://uiaec.ujs.edu.cn/news_list.php?parentid=4/"
+    )
+    urls.append(url)
 
 # 2. 低频词过滤滑动条
 min_freq = st.slider("过滤低频词（最小词频）", min_value=1, max_value=10, value=2, step=1)
 
 # 3. 分析按钮
 if st.button("🚀 开始分析", type="primary"):
-    if not url.strip():
-        st.warning("请输入有效的URL")
+    # 过滤空URL
+    valid_urls = [url.strip() for url in urls if url.strip()]
+    if not valid_urls:
+        st.warning("请输入至少一个有效的URL")
     else:
-        with st.spinner("正在抓取URL并分析..."):
-            # 步骤1：抓取文本
-            text = fetch_url_content(url)
-            if not text:
+        with st.spinner("正在抓取网页并分析..."):
+            # 批量抓取所有URL的文本
+            all_text = ""
+            for url in valid_urls:
+                text = fetch_url_all_text(url)
+                all_text += text + "\n"
+            
+            if not all_text.strip():
+                st.warning("未抓取到任何有效文本")
                 st.stop()
             
-            # 步骤2：分词
-            words = segment_text(text)
-            if not words:
-                st.warning("分词后无有效词汇")
-                st.stop()
+            # 处理文本并统计词频
+            top20_words, word_freq = process_text_for_freq(all_text, min_freq)
             
-            # 步骤3：统计词频（过滤低频词）
-            word_freq = get_word_freq(words, min_freq)
             if not word_freq:
-                st.warning(f"无满足最小词频{min_freq}的词汇，请降低最小词频阈值")
+                st.warning(f"无满足最小词频{min_freq}的词汇，请降低阈值")
                 st.stop()
             
-            # 步骤4：获取词频前20的词汇
-            top20_words = word_freq.most_common(20)
+            # 调用text_proc.py保存词频结果
+            text_proc.save_word_freq_to_file(dict(word_freq), top20_words)
+            
+            # 提取数据用于可视化
             top20_words_list = [word for word, freq in top20_words]
             top20_freq_list = [freq for word, freq in top20_words]
 
             # ---------------------- 结果展示 ----------------------
-            st.success(f"✅ 分析完成！共抓取有效词汇 {len(word_freq)} 个")
+            st.success(f"✅ 分析完成！共抓取{len(valid_urls)}个网页，统计到{len(word_freq)}个有效词汇")
             
             # 分两列展示：词频排名 + 图表
             col1, col2 = st.columns([1, 2])
@@ -182,7 +164,6 @@ if st.button("🚀 开始分析", type="primary"):
                 st.markdown(f"### 📊 {chart_type}")
                 # 根据选择的图表类型生成对应图表
                 if chart_type == "词云图":
-                    # 词云图数据格式：[(词, 频), ...]
                     wordcloud_data = list(word_freq.items())
                     wc = (
                         WordCloud()
@@ -196,7 +177,7 @@ if st.button("🚀 开始分析", type="primary"):
                         Bar()
                         .add_xaxis(top20_words_list)
                         .add_yaxis("词频", top20_freq_list)
-                        .reversal_axis()  # 横向柱状图，更适合展示词汇
+                        .reversal_axis()
                         .set_global_opts(
                             title_opts=opts.TitleOpts(title="词频前20柱状图", pos_left="center"),
                             xaxis_opts=opts.AxisOpts(name="词频"),
@@ -227,7 +208,6 @@ if st.button("🚀 开始分析", type="primary"):
                     st_pyecharts(pie, width="100%", height="500px")
                 
                 elif chart_type == "词频雷达图":
-                    # 雷达图最多展示前10个词汇，避免过于拥挤
                     radar_words = top20_words_list[:10]
                     radar_freq = top20_freq_list[:10]
                     if radar_freq:
@@ -252,7 +232,6 @@ if st.button("🚀 开始分析", type="primary"):
                     st_pyecharts(scatter, width="100%", height="500px")
                 
                 elif chart_type == "词频热力图":
-                    # 热力图数据格式：[[行, 列, 值], ...]
                     heatmap_data = [[0, idx, freq] for idx, freq in enumerate(top20_freq_list)]
                     heatmap = (
                         HeatMap()
@@ -276,7 +255,6 @@ if st.button("🚀 开始分析", type="primary"):
                     st_pyecharts(treemap, width="100%", height="500px")
                 
                 elif chart_type == "词频极坐标图":
-                    # 极坐标图最多展示前10个词汇
                     polar_words = top20_words_list[:10]
                     polar_freq = top20_freq_list[:10]
                     if polar_freq:
@@ -291,7 +269,7 @@ if st.button("🚀 开始分析", type="primary"):
 # ---------------------- 侧边栏说明 ----------------------
 st.sidebar.markdown("---")
 st.sidebar.markdown("#### 📝 使用说明")
-st.sidebar.markdown("1. 输入**文章详情页URL**（非列表页）")
+st.sidebar.markdown("1. 输入**任意网页URL**（支持多个URL批量分析）")
 st.sidebar.markdown("2. 调整滑动条设置最小词频阈值")
-st.sidebar.markdown("3. 点击「开始分析」查看结果")
+st.sidebar.markdown("3. 点击「开始分析」查看整站文本的词频结果")
 st.sidebar.markdown("4. 侧边栏切换不同图表类型")
